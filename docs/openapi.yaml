@@ -601,9 +601,14 @@ components:
             - page
             - limit
             - totalPages
+        requestId:
+          type: string
+          description: Correlation ID also returned in the X-Request-Id response header.
+          example: req-123
       required:
         - data
         - pagination
+        - requestId
     CampaignDetailResponse:
       type: object
       properties:
@@ -911,12 +916,36 @@ components:
           required:
             - status
             - reachable
+        indexer:
+          type: object
+          properties:
+            lastSuccessfulPollTime:
+              type:
+                - number
+                - "null"
+            lastKnownLedger:
+              type: number
+            isHealthy:
+              type: boolean
+            consecutiveFailures:
+              type: number
+            lagMs:
+              type:
+                - number
+                - "null"
+          required:
+            - lastSuccessfulPollTime
+            - lastKnownLedger
+            - isHealthy
+            - consecutiveFailures
+            - lagMs
       required:
         - service
         - status
         - timestamp
         - uptimeSeconds
         - database
+        - indexer
     DeepHealthResponse:
       type: object
       properties:
@@ -972,10 +1001,45 @@ components:
               required:
                 - status
                 - details
+            indexer:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - up
+                    - down
+                details:
+                  type: object
+                  properties:
+                    lastSuccessfulPollTime:
+                      type:
+                        - number
+                        - "null"
+                    lastKnownLedger:
+                      type: number
+                    isHealthy:
+                      type: boolean
+                    consecutiveFailures:
+                      type: number
+                    lagMs:
+                      type:
+                        - number
+                        - "null"
+                  required:
+                    - lastSuccessfulPollTime
+                    - lastKnownLedger
+                    - isHealthy
+                    - consecutiveFailures
+                    - lagMs
+              required:
+                - status
+                - details
           required:
             - db
             - soroban
             - contract
+            - indexer
       required:
         - overall
         - timestamp

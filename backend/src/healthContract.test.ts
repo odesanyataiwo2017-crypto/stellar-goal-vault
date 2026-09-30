@@ -2,7 +2,7 @@
  * Observability contract tests for the health endpoints (#1036).
  *
  * Operators and uptime monitors rely on specific structured fields from
- * `/api/health` and `/api/health/deep`, on the `X-Request-ID` header, and on
+ * `/api/health` and `/api/health/deep`, on the `X-Request-Id` header, and on
  * the structured request log. These tests pin those fields for both success
  * and failure paths, so a refactor that drops or renames one fails here
  * instead of silently breaking dashboards and alerts.
@@ -10,23 +10,37 @@
  * Every response is also validated against the published OpenAPI schema, so
  * the spec in `docs/openapi.yaml` can't drift from what the endpoints return.
  */
+import fs from 'fs';
+import type { Express } from 'express';
+import path from 'path';
 import request from 'supertest';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { z } from 'zod';
 
-// Hoisted so it runs before the app (and its config) is imported.
-vi.hoisted(() => {
-  process.env.DB_PATH = ':memory:';
-  process.env.NODE_ENV = 'test';
-});
+const TEST_DB_PATH = path.join(
+  '/tmp',
+  `stellar-goal-vault-health-contract-${process.pid}-${Date.now()}.db`,
+);
+
+process.env.DB_PATH = TEST_DB_PATH;
+process.env.CONTRACT_ID = '';
+process.env.NODE_ENV = 'test';
 
 const CONTRACT_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const SOROBAN_RPC_URL = 'http://soroban.test';
 
 type DbHealth = { status: 'up' | 'down'; reachable: boolean; error?: string };
+type IndexerHealth = ReturnType<
+  typeof import('./services/eventIndexer')['getIndexerStatus']
+>;
 
-// Lets each test choose the database probe result without touching SQLite.
+// Lets each test choose the database / indexer probe result without touching
+// SQLite or the poller.
 const dbHealth = vi.hoisted(() => ({
   impl: null as null | (() => DbHealth),
+}));
+const indexerHealth = vi.hoisted(() => ({
+  impl: null as null | (() => IndexerHealth),
 }));
 
 vi.mock('./services/db', async (importOriginal) => {
@@ -37,30 +51,76 @@ vi.mock('./services/db', async (importOriginal) => {
   };
 });
 
-import { app } from './index';
-import { config } from './config';
-import { initCampaignStore } from './services/campaignStore';
-import { logger } from './logger';
-import { REQUEST_ID_HEADER } from './middleware/requestId';
-import {
-  deepHealthErrorResponseSchema,
-  deepHealthResponseSchema,
-  healthResponseSchema,
-} from './openapi';
+vi.mock('./services/eventIndexer', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./services/eventIndexer')>();
+  return {
+    ...actual,
+    getIndexerStatus: () =>
+      indexerHealth.impl ? indexerHealth.impl() : actual.getIndexerStatus(),
+  };
+});
+
+let app: Express;
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DB_PATH, { force: true });
+  const { initCampaignStore } = await import('./services/campaignStore');
+  ({ app } = await import('./index'));
+  ({
+    healthResponseSchema,
+    deepHealthResponseSchema,
+    deepHealthErrorResponseSchema,
+  } = await import('./openapi'));
+  initCampaignStore();
+});
+
+afterAll(() => {
+  fs.rmSync(TEST_DB_PATH, { force: true });
+});
+
+let config: typeof import('./config')['config'];
+let healthResponseSchema: z.ZodTypeAny;
+let deepHealthResponseSchema: z.ZodTypeAny;
+let deepHealthErrorResponseSchema: z.ZodTypeAny;
+let originalContractId: string;
+let originalSorobanRpcUrl: string;
 
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
 const DB_DOWN: DbHealth = { status: 'down', reachable: false, error: 'SQLITE_CANTOPEN: unable to open database file' };
 
-const originalContractId = config.contractId;
-const originalSorobanRpcUrl = config.sorobanRpcUrl;
+function indexerUp(): IndexerHealth {
+  return {
+    lastSuccessfulPollTime: Date.now(),
+    lastKnownLedger: 123456,
+    isHealthy: true,
+    consecutiveFailures: 0,
+    lagMs: 1_500,
+    freshness: 'fresh',
+    staleLagMs: 300_000,
+    freshLagMs: 30_000,
+  };
+}
 
-beforeAll(() => {
-  // The healthy paths exercise the real SQLite probe.
-  initCampaignStore();
-});
+function indexerDown(): IndexerHealth {
+  return {
+    lastSuccessfulPollTime: null,
+    lastKnownLedger: 123456,
+    isHealthy: false,
+    consecutiveFailures: 5,
+    lagMs: null,
+    freshness: 'failing',
+    staleLagMs: 300_000,
+    freshLagMs: 30_000,
+  };
+}
 
-beforeEach(() => {
+beforeEach(async () => {
+  ({ config } = await import('./config'));
+  originalContractId = config.contractId;
+  originalSorobanRpcUrl = config.sorobanRpcUrl;
+
   dbHealth.impl = null;
+  indexerHealth.impl = null;
   config.contractId = CONTRACT_ID;
   config.sorobanRpcUrl = SOROBAN_RPC_URL;
   vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })));
@@ -82,6 +142,7 @@ function expectCommonHealthFields(body: Record<string, unknown>) {
 
 /** Send a request and return the response plus the structured request log it produced. */
 async function withRequestLog(send: () => PromiseLike<request.Response>) {
+  const { logger } = await import('./logger');
   const infoSpy = vi.spyOn(logger, 'info');
   const response = await send();
   await new Promise((resolve) => setImmediate(resolve));
@@ -94,6 +155,8 @@ async function withRequestLog(send: () => PromiseLike<request.Response>) {
 
 describe('GET /api/health contract', () => {
   it('reports ok with the database probe fields when healthy', async () => {
+    indexerHealth.impl = indexerUp;
+
     const response = await request(app).get('/api/health');
 
     expect(response.status).toBe(200);
@@ -109,6 +172,7 @@ describe('GET /api/health contract', () => {
 
   it('reports degraded with the database error when the probe fails', async () => {
     dbHealth.impl = () => DB_DOWN;
+    indexerHealth.impl = indexerUp;
 
     const response = await request(app).get('/api/health');
 
@@ -118,6 +182,19 @@ describe('GET /api/health contract', () => {
       status: 'degraded',
       database: { status: 'down', reachable: false, error: DB_DOWN.error },
     });
+    expectCommonHealthFields(response.body);
+    expect(() => healthResponseSchema.parse(response.body)).not.toThrow();
+  });
+
+  it('reports degraded when the event indexer is failing', async () => {
+    indexerHealth.impl = indexerDown;
+
+    const response = await request(app).get('/api/health');
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe('degraded');
+    expect(response.body.indexer).toMatchObject({ isHealthy: false, consecutiveFailures: 5 });
+    expect(response.body.database.reachable).toBe(true);
     expectCommonHealthFields(response.body);
     expect(() => healthResponseSchema.parse(response.body)).not.toThrow();
   });
@@ -137,6 +214,8 @@ describe('GET /api/health/deep contract', () => {
   }
 
   it('reports up with every component when all checks pass', async () => {
+    indexerHealth.impl = indexerUp;
+
     const response = await request(app).get('/api/health/deep');
 
     expect(response.status).toBe(200);
@@ -147,12 +226,14 @@ describe('GET /api/health/deep contract', () => {
       db: { status: 'up' },
       soroban: { status: 'up' },
       contract: { status: 'up' },
+      indexer: { status: 'up' },
     });
     expect(() => deepHealthResponseSchema.parse(response.body)).not.toThrow();
   });
 
   it('marks the database down with its error as details', async () => {
     dbHealth.impl = () => DB_DOWN;
+    indexerHealth.impl = indexerUp;
 
     const response = await request(app).get('/api/health/deep');
 
@@ -167,6 +248,7 @@ describe('GET /api/health/deep contract', () => {
     vi.stubGlobal('fetch', vi.fn(async () => {
       throw new TypeError('fetch failed');
     }));
+    indexerHealth.impl = indexerUp;
 
     const response = await request(app).get('/api/health/deep');
 
@@ -180,6 +262,7 @@ describe('GET /api/health/deep contract', () => {
 
   it('marks the contract down when CONTRACT_ID is not configured', async () => {
     config.contractId = '';
+    indexerHealth.impl = indexerUp;
 
     const response = await request(app).get('/api/health/deep');
 
@@ -190,10 +273,27 @@ describe('GET /api/health/deep contract', () => {
     expect(() => deepHealthResponseSchema.parse(response.body)).not.toThrow();
   });
 
+  it('marks the indexer down when the poller is failing', async () => {
+    indexerHealth.impl = indexerDown;
+
+    const response = await request(app).get('/api/health/deep');
+
+    expect(response.status).toBe(503);
+    expect(response.body.overall).toBe('down');
+    expect(response.body.components.indexer.status).toBe('down');
+    expect(response.body.components.indexer.details).toMatchObject({
+      isHealthy: false,
+      consecutiveFailures: 5,
+    });
+    expect(response.body.components.db.status).toBe('up');
+    expect(() => deepHealthResponseSchema.parse(response.body)).not.toThrow();
+  });
+
   it('returns the error shape when the check itself throws', async () => {
     dbHealth.impl = () => {
       throw new Error('probe exploded');
     };
+    indexerHealth.impl = indexerUp;
 
     const response = await request(app).get('/api/health/deep');
 
@@ -214,9 +314,11 @@ describe('health check correlation and request-log contract', () => {
     ['/api/health', 503, () => DB_DOWN],
     ['/api/health/deep', 200, () => null],
     ['/api/health/deep', 503, () => DB_DOWN],
-  ] as const)('%s (%i) echoes X-Request-ID and logs the structured request fields', async (path, status, db) => {
+  ] as const)('%s (%i) echoes X-Request-Id and logs the structured request fields', async (path, status, db) => {
+    const { REQUEST_ID_HEADER } = await import('./middleware/requestId');
     const probe = db();
     dbHealth.impl = probe ? () => probe : null;
+    indexerHealth.impl = indexerUp;
 
     const { response, log } = await withRequestLog(() =>
       request(app).get(path).set(REQUEST_ID_HEADER, `health-contract-${status}`),
